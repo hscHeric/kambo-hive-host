@@ -66,14 +66,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Total de {} tarefas adicionadas.", tm.get_total_tasks());
     drop(tm);
 
-    let addr_to_advertise = if let Some((ip, _porta_antiga)) = bind_addr.rsplit_once(':') {
-        format!("{}:{}", ip, 2901)
-    } else {
-        format!("{}:{}", bind_addr, 2901)
-    };
-
+    let addr_clone = bind_addr.clone();
     tokio::spawn(async move {
-        listen_for_workers(addr_to_advertise).await;
+        listen_for_workers(addr_clone).await;
     });
 
     if let Some(path) = save_path {
