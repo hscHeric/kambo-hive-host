@@ -1,8 +1,10 @@
-use kambo_hive::host::{result_aggregator::ResultAggregator, task_manager::TaskManager};
-use kambo_hive::utils::init_logger;
-use log::{error, info};
+use kambo_hive::host::{
+    periodic_saver, result_aggregator::ResultAggregator, task_manager::TaskManager,
+};
+use kambo_hive::utils::{init_logger, listen_for_workers};
+use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
-use std::{env, fs, sync::Arc};
+use std::{env, fs, process, sync::Arc};
 use tokio::sync::Mutex;
 
 #[derive(Serialize, Deserialize)]
@@ -19,32 +21,38 @@ pub struct GAConfig {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_logger();
     let args: Vec<String> = env::args().collect();
+
     if args.len() < 3 {
-        eprintln!("Uso: {} <bind_addr:port> <graphs_path>", args[0]);
-        return Ok(());
+        eprintln!(
+            "Uso: {} <bind_addr:port> <graphs_path> [save_path] [save_interval_secs]",
+            args[0]
+        );
+        eprintln!(
+            "Exemplo: {} 0.0.0.0:12345 ./graphs results.json 60",
+            args[0]
+        );
+        process::exit(1);
     }
 
-    let addr = &args[1];
+    let bind_addr = &args[1];
     let graphs_path = &args[2];
+    let save_path = args.get(3);
+    let save_interval = args.get(4).and_then(|s| s.parse().ok());
 
     let task_manager = Arc::new(Mutex::new(TaskManager::new()));
     let result_aggregator = Arc::new(Mutex::new(ResultAggregator::new()));
 
-    // Configuração do Algoritmo Genético
     let ga_config = GAConfig {
         trials: 10,
         max_stagnant: 100,
         generations: 1000,
         tournament_size: 2,
         crossover_probability: 0.9,
-        pop_size: None, // `None` para deixar o AG calcular
+        pop_size: None,
     };
     let ag_config_str = serde_json::to_string(&ga_config)?;
-
-    // Ler a pasta de grafos e criar as tasks
     info!("Lendo grafos de: {}", graphs_path);
     let paths = fs::read_dir(graphs_path)?;
-
     let mut tm = task_manager.lock().await;
     for path in paths {
         let path = path?.path();
@@ -56,11 +64,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     info!("Total de {} tarefas adicionadas.", tm.get_total_tasks());
-    drop(tm); // Liberar o lock
+    drop(tm);
 
-    // Iniciar o servidor
+    let addr_to_advertise = if let Some((ip, _porta_antiga)) = bind_addr.rsplit_once(':') {
+        format!("{}:{}", ip, 2901)
+    } else {
+        format!("{}:{}", bind_addr, 2901)
+    };
+
+    tokio::spawn(async move {
+        listen_for_workers(addr_to_advertise).await;
+    });
+
+    if let Some(path) = save_path {
+        let interval = save_interval.unwrap_or(300);
+        periodic_saver::start(Arc::clone(&result_aggregator), path.clone(), interval);
+    } else {
+        warn!("Salvamento periódico desativado. Forneça um caminho e intervalo para ativar.");
+    }
+
+    info!("Host TCP escutando em {}", bind_addr);
     if let Err(e) =
-        kambo_hive::host::server::start_server(addr, task_manager, result_aggregator).await
+        kambo_hive::host::server::start_server(bind_addr, task_manager, result_aggregator).await
     {
         error!("Erro no servidor: {}", e);
     }
